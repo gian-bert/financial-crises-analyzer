@@ -1,0 +1,116 @@
+# .github/workflows/deploy.yml
+#
+# Auto-deploys the Financial Crises Analyzer to Posit Connect Cloud
+# every time a commit is pushed to main/master.
+#
+# ONE-TIME SETUP REQUIRED — see README.md for the full walkthrough.
+# Quick summary of what you need to add in GitHub → Settings → Secrets and variables → Actions:
+#
+#   Secrets (hidden in logs):
+#     RSCONNECT_CLIENT_ID      ← clientId from Posit Cloud credentials
+#     RSCONNECT_CLIENT_SECRET  ← clientSecret from Posit Cloud credentials
+#
+#   Variables (visible in logs):
+#     RSCONNECT_USERNAME       ← your Posit Connect Cloud username
+#     APP_NAME                 ← e.g. financial-crises-analyzer
+#     APP_TITLE                ← e.g. Financial Crises Analyzer
+#     CONNECT_CONTENT_ID       ← UUID from the app URL after first manual deploy
+
+name: Deploy to Posit Connect Cloud
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:   # lets you trigger a deploy manually from the Actions tab
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.6.1"
+
+      - name: Install pak
+        run: |
+          UBUNTU_CODENAME=$(lsb_release -cs)
+          Rscript -e "
+            install.packages('pak',
+              repos = paste0('https://packagemanager.posit.co/cran/__linux__/',
+                             '${UBUNTU_CODENAME}', '/latest'))
+          "
+
+      - name: Instruct renv to use pak
+        run: echo 'options(renv.config.pak.enabled = TRUE)' >> .Rprofile
+
+      - name: Restore packages from renv.lock
+        uses: r-lib/actions/setup-renv@v2
+
+      - name: Install rsconnect (if not in renv.lock)
+        run: Rscript -e "if (!requireNamespace('rsconnect', quietly=TRUE)) pak::pak('rstudio/rsconnect')"
+
+      - name: Authenticate with Posit Connect Cloud
+        run: |
+          Rscript -e '
+            rsconnect::connectCloudClientCredentials(
+              clientId     = Sys.getenv("RSCONNECT_CLIENT_ID"),
+              clientSecret = Sys.getenv("RSCONNECT_CLIENT_SECRET"),
+              accountName  = Sys.getenv("RSCONNECT_USERNAME"),
+              name         = NULL
+            )
+          '
+        env:
+          RSCONNECT_CLIENT_ID:     ${{ secrets.RSCONNECT_CLIENT_ID }}
+          RSCONNECT_CLIENT_SECRET: ${{ secrets.RSCONNECT_CLIENT_SECRET }}
+          RSCONNECT_USERNAME:      ${{ vars.RSCONNECT_USERNAME }}
+
+      - name: Write deployment config (.dcf)
+        # Tells rsconnect which existing piece of content to overwrite
+        # instead of creating a new one on every push.
+        run: |
+          mkdir -p "rsconnect/connect.posit.cloud/${RSCONNECT_USERNAME}"
+          cat > "rsconnect/connect.posit.cloud/${RSCONNECT_USERNAME}/${APP_NAME}.dcf" <<EOF
+          name: ${APP_NAME}
+          title: ${APP_TITLE}
+          username: ${RSCONNECT_USERNAME}
+          account: ${RSCONNECT_USERNAME}
+          server: connect.posit.cloud
+          hostUrl: https://api.connect.posit.cloud/v1
+          appId: ${CONNECT_CONTENT_ID}
+          EOF
+        env:
+          APP_NAME:           ${{ vars.APP_NAME }}
+          APP_TITLE:          ${{ vars.APP_TITLE }}
+          CONNECT_CONTENT_ID: ${{ vars.CONNECT_CONTENT_ID }}
+          RSCONNECT_USERNAME: ${{ vars.RSCONNECT_USERNAME }}
+
+      - name: Deploy to Posit Connect Cloud
+        run: |
+          Rscript -e '
+            rsconnect::deployApp(
+              appDir      = ".",
+              appId       = Sys.getenv("CONNECT_CONTENT_ID"),
+              appTitle    = Sys.getenv("APP_TITLE"),
+              account     = Sys.getenv("RSCONNECT_USERNAME"),
+              forceUpdate = TRUE,
+              logLevel    = "verbose"
+            )
+          '
+        env:
+          CONNECT_CONTENT_ID: ${{ vars.CONNECT_CONTENT_ID }}
+          APP_TITLE:          ${{ vars.APP_TITLE }}
+          RSCONNECT_USERNAME: ${{ vars.RSCONNECT_USERNAME }}
+
+      - name: Remove credentials from runner
+        if: always()
+        run: |
+          Rscript -e 'rsconnect::removeAccount(name = Sys.getenv("RSCONNECT_USERNAME"))'
+        env:
+          RSCONNECT_USERNAME: ${{ vars.RSCONNECT_USERNAME }}
