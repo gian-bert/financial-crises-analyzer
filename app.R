@@ -786,12 +786,32 @@ APP_CSS <- "
    two-finger scroll (which rarely tracks perfectly vertical) could be
    read by the browser as a horizontal pan or pinch-zoom gesture instead
    of a plain scroll — which is what makes a panel look like it's being
-   'resized' rather than scrolled. */
-.sidebar {
-  overflow-x: hidden !important;
-  overflow-y: auto !important;
-  touch-action: pan-y !important;
-  overscroll-behavior: contain;
+   'resized' rather than scrolled.
+   Desktop/tablet only (bslib's sidebar breakpoint): on phones the sidebar
+   is part of the page, and `overscroll-behavior: contain` there can stop a
+   swipe that starts on the menu from scrolling the page (see Phones below). */
+@media (min-width: 576px) {
+  .sidebar {
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+    touch-action: pan-y !important;
+    overscroll-behavior: contain;
+  }
+}
+/* Phones (below bslib's 576px breakpoint): bslib stacks the menu and the
+   cards into one long page. Fixed-height cards and tables with their own
+   scroll areas would catch the finger mid-swipe and scroll themselves
+   instead of the page, so every card grows to fit its content and only the
+   page scrolls vertically. Wide tables still scroll sideways in their card. */
+@media (max-width: 575.98px) {
+  .bslib-card { height: auto !important; max-height: none !important; }
+  .bslib-card .card-body {
+    max-height: none !important;
+    overflow-x: auto !important;
+    overflow-y: visible !important;
+  }
+  .plot-card .shiny-plot-output { height: 300px !important; }
+  .r-table-scroll { max-height: none !important; overflow-y: visible !important; }
 }
 .plot-card .html-widget {
   height: 100% !important;
