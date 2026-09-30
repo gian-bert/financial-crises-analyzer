@@ -157,12 +157,17 @@ either mode, set the environment variable `FCA_HOSTED` to `true` or `false`.
 
 ## Updating the `renv.lock`
 
-If you add R packages, regenerate the lockfile locally:
+`renv.lock` pins every package the app needs (shiny, bslib and all their
+dependencies) with its version and hash; the deploy restores exactly these.
+If you add R packages, regenerate it from the app folder, using the R version set
+in `.github/workflows/deploy.yml` (the lockfile records it):
 
 ```r
-install.packages("renv")
-renv::init()
+install.packages(c("renv", "shiny", "bslib"))   # plus any package you added
+options(repos = c(CRAN = "https://cloud.r-project.org"),
+        renv.lockfile.version = 1)              # compact lockfile with package hashes
 renv::snapshot()
 ```
 
-Then commit the updated `renv.lock`.
+This only rewrites `renv.lock`, which is the one file to commit. `renv::init()`
+isn't needed; if you use it, don't commit the `renv/` folder or `.Rprofile` it creates.
