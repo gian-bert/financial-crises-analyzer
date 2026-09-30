@@ -105,7 +105,8 @@ Go to your GitHub repo → **Settings → Secrets and variables → Actions**.
 
 ### Step 6 — Push a commit and watch it deploy
 
-Any commit to `main` or `master` now triggers an automatic deploy.
+Any commit to `main` or `master` now triggers an automatic deploy
+(`.github/workflows/deploy.yml`; until `CONNECT_CONTENT_ID` is set, the deploy job is skipped).
 You can also trigger one manually: **Actions tab → Deploy to Posit Connect Cloud → Run workflow**.
 
 ---
@@ -114,6 +115,20 @@ You can also trigger one manually: **Actions tab → Deploy to Posit Connect Clo
 
 Edit `app.R` locally, commit, and push. The GitHub Actions workflow picks it up,
 restores packages from `renv.lock`, and redeploys within ~2–3 minutes.
+
+## Running the tests
+
+`tests/server.R` checks the server logic with shiny's built-in `testServer()`:
+every output renders, cleared inputs don't error, window start dates are exact,
+imports stay isolated per session on hosted deployments, and imported index
+names are HTML-escaped. From the app folder:
+
+```r
+shiny::runTests()
+```
+
+The **Tests** workflow (`.github/workflows/test.yml`) runs the same tests, plus a
+check that the app starts, on every pull request and on pushes to `main`.
 
 ---
 
@@ -125,11 +140,18 @@ restores packages from `renv.lock`, and redeploys within ~2–3 minutes.
 
 ## Notes on imports
 
-On Connect Cloud the app bundle is read-only at runtime. The app detects this
-automatically and stores any user-imported indices in a session-scoped temp directory.
-Imports work during the session but are lost when the session ends — a yellow
-warning banner in the Import panel makes this clear. The 7 built-in indices
+Run locally, imported indices are saved to `data/` and are there after a restart.
+
+On a hosted deployment one R process serves many visitors, so the app switches to
+**hosted mode**: each visitor's imports (and any replaced or deleted index) stay in
+memory for that browser session only. Other visitors never see them, and nothing
+is written to disk. Imports are lost when the session ends — a yellow warning
+banner in the Import panel makes this clear. The 7 built-in indices
 (SPX, DJI, EUR/CHF, VIX, USD/CHF, GBP/CHF, JPY/CHF) are always available.
+
+Hosted mode is detected automatically: the app bundle is read-only on Connect Cloud
+and shinyapps.io, and Posit Connect and shinyapps.io set `R_CONFIG_ACTIVE`. To force
+either mode, set the environment variable `FCA_HOSTED` to `true` or `false`.
 
 ---
 

@@ -65,23 +65,29 @@ N_VALUES <- c(1L, 2L, 3L, 5L, 10L, 15L, 20L, 30L, 90L)
 DATA_DIR        <- "data"     # built-in CSVs always live here (read is always fine)
 MIN_IMPORT_ROWS <- 30L        # below this, reject the file as too short to be useful
 
-# Detect whether the app directory is writable (it isn't on Posit Connect Cloud /
-# shinyapps.io — those platforms mount the bundle read-only).  If not writable,
-# redirect all imports to a session-scoped temp directory.  The 7 built-in indices
-# always load from DATA_DIR regardless.
-IMPORT_DIR <- tryCatch({
+# Local vs. hosted mode.
+#   Local  (shiny::runApp() on your own machine): imports are written to
+#          DATA_DIR and shared by every browser tab, so they survive restarts.
+#   Hosted (Posit Connect Cloud / Connect / shinyapps.io): one R process
+#          serves many visitors, so imports stay in memory for the browser
+#          session that made them and nothing is written to disk. Otherwise
+#          one visitor could add, replace or delete indices for everyone else.
+# Hosted mode is detected when the app bundle is read-only (Connect Cloud,
+# shinyapps.io) or when R_CONFIG_ACTIVE carries the value Connect or
+# shinyapps.io set. FCA_HOSTED=true/false overrides the detection either way.
+DATA_DIR_WRITABLE <- tryCatch({
   probe <- file.path(DATA_DIR, ".write_probe")
   writeLines("ok", probe)
   unlink(probe)
-  DATA_DIR                          # writable → keep everything together (local use)
-}, error = function(e) {
-  tmp <- file.path(tempdir(), "fca_imports")
-  dir.create(tmp, showWarnings = FALSE, recursive = TRUE)
-  tmp                               # read-only host → session-local temp
+  TRUE
+}, error = function(e) FALSE)
+IS_HOSTED <- local({
+  forced <- as.logical(Sys.getenv("FCA_HOSTED", NA))
+  if (!is.na(forced)) return(forced)
+  !DATA_DIR_WRITABLE || Sys.getenv("R_CONFIG_ACTIVE") %in% c("rsconnect", "shinyapps")
 })
-IS_READONLY_HOST <- !identical(IMPORT_DIR, DATA_DIR)
 
-REGISTRY_PATH <- file.path(IMPORT_DIR, "imported_index_registry.csv")
+REGISTRY_PATH <- file.path(DATA_DIR, "imported_index_registry.csv")
 
 INDEX_CFG <- list(
   SPX    = list(label="S&P 500",  color="#F59E0B", obs_years=10, default_n=20L),
@@ -104,8 +110,10 @@ BUILTIN_TICKERS <- names(INDEX_CFG)
 # visually with an existing one on the multi-index Term Structure chart.
 IMPORT_PALETTE <- c("#14B8A6", "#EAB308", "#8B5CF6", "#EC4899", "#06B6D4",
                      "#84CC16", "#F97316", "#6366F1", "#0EA5E9", "#D946EF")
-next_color <- function() {
-  used <- vapply(INDEX_CFG, function(x) x$color, character(1))
+# `cfg` is the INDEX_CFG in effect for the caller (a session-local copy in
+# hosted mode — see the top of the server function).
+next_color <- function(cfg) {
+  used <- vapply(cfg, function(x) x$color, character(1))
   free <- setdiff(IMPORT_PALETTE, used)
   if (length(free) > 0) return(free[1])
   # Palette exhausted (10+ imports) — fall back to a random HSL hue rather
@@ -125,14 +133,19 @@ lag_vec <- function(x, n) {
 }
 
 # Pre-computes the all_returns[[ticker]] structure for ONE index: a named
-# list, keyed by N (as a string), of data.frame(date, value, ret). Used both
-# for the 7 built-in indices at startup and for any index imported later in
-# Section 3c — kept as one function so both paths can never drift apart.
+# list, keyed by N (as a string), of data.frame(date, start, value, ret).
+# `date` is the END of each N-day window (the day the return is measured on)
+# and `start` is the trading day N rows earlier whose price the return is
+# measured from, so window start dates are exact rather than estimated.
+# Used both for the 7 built-in indices at startup and for any index imported
+# later in Section 3c — kept as one function so both paths can never drift apart.
 compute_returns_for_index <- function(df) {
   v <- df$value
   lapply(setNames(as.list(N_VALUES), as.character(N_VALUES)), function(n) {
-    ret <- v / lag_vec(v, n) - 1
-    data.frame(date=df$date, value=v, ret=ret, stringsAsFactors=FALSE)
+    ret   <- v / lag_vec(v, n) - 1
+    s_idx <- seq_along(v) - n
+    start <- df$date[ifelse(s_idx >= 1, s_idx, NA)]
+    data.frame(date=df$date, start=start, value=v, ret=ret, stringsAsFactors=FALSE)
   })
 }
 
@@ -158,8 +171,8 @@ all_returns <- lapply(names(INDEX_CFG), function(tk) compute_returns_for_index(r
 names(all_returns) <- names(INDEX_CFG)
 
 # ── 2b. Re-load any indices imported in a previous run ──────────────────────
-# The "Import Index" sidebar control (Section 3c / server) writes each new
-# index's data to DATA_DIR and appends one row to REGISTRY_PATH. On startup,
+# In local mode, the "Import Index" sidebar control (Section 3c / server) writes
+# each new index's data to DATA_DIR and appends one row to REGISTRY_PATH. On startup,
 # replay that registry so imported indices survive an app restart — exactly
 # like the 7 built-ins above, just driven by a small CSV instead of code.
 # Any row that fails to load (missing file, corrupted registry edit, etc.)
@@ -238,7 +251,7 @@ compute_stats <- function(rets) {
 }
 
 # Top-k worst and best episodes
-compute_episodes <- function(ret_df, n_days, k=5) {
+compute_episodes <- function(ret_df, k=5) {
   r <- ret_df[!is.na(ret_df$ret), ]
   if (nrow(r) == 0) return(NULL)
 
@@ -248,9 +261,9 @@ compute_episodes <- function(ret_df, n_days, k=5) {
       Rank   = seq_len(nrow(rows)),
       Type   = type,
       Return = rows$ret,
-      Start  = fmt_date(as.Date(rows$date) - n_days),
+      Start  = fmt_date(rows$start),
       End    = fmt_date(rows$date),
-      StartDate = as.Date(rows$date) - n_days,
+      StartDate = as.Date(rows$start),
       EndDate   = as.Date(rows$date),
       stringsAsFactors = FALSE
     )
@@ -267,13 +280,10 @@ compute_episodes <- function(ret_df, n_days, k=5) {
 # extend far enough back). "Complete" = TRUE when Coverage >= obs_years
 # (within a small tolerance for date-arithmetic rounding).
 #
-# n_days: the selected window length N — needed to back-calculate the
-#   START of the specific N-day window that produced the worst/best return.
-#   The END of that window is recorded directly from the data (it is the row
-#   whose return was the most extreme). The START is computed as
-#   end_date − n_days (calendar days, not trading days — same approximation
-#   used in the Term Structure table, and sufficient for display purposes).
-compute_rolling_windows <- function(ret_df, obs_years, n_days=20L, n_anchors=40,
+# For each anchor, the START and END of the specific N-day window that
+# produced the worst/best return are read straight from that return's row
+# (its `start` and `date` columns — see compute_returns_for_index).
+compute_rolling_windows <- function(ret_df, obs_years, n_anchors=40,
                                      coverage_tol=0.98) {
   r <- ret_df[!is.na(ret_df$ret), ]
   if (nrow(r) < 5) return(NULL)
@@ -292,17 +302,15 @@ compute_rolling_windows <- function(ret_df, obs_years, n_days=20L, n_anchors=40,
 
     wi <- which.min(sub$ret)   # row index of worst return within this window
     bi <- which.max(sub$ret)   # row index of best  return within this window
-    worst_end <- as.Date(sub$date[wi])
-    best_end  <- as.Date(sub$date[bi])
 
     data.frame(
       Anchor     = anchor,
       Worst      = sub$ret[wi],
-      WorstStart = worst_end - n_days,   # ≈ start of the N-day window
-      WorstEnd   = worst_end,            # last day of that window (= return date)
+      WorstStart = as.Date(sub$start[wi]),   # first day of that N-day window
+      WorstEnd   = as.Date(sub$date[wi]),    # last day of that window (= return date)
       Best       = sub$ret[bi],
-      BestStart  = best_end  - n_days,
-      BestEnd    = best_end,
+      BestStart  = as.Date(sub$start[bi]),
+      BestEnd    = as.Date(sub$date[bi]),
       Coverage   = coverage,
       Complete   = (coverage >= obs_years * coverage_tol),
       stringsAsFactors = FALSE
@@ -312,14 +320,15 @@ compute_rolling_windows <- function(ret_df, obs_years, n_days=20L, n_anchors=40,
 }
 
 # Rank-th worst/best across all N values (term structure) for ONE ticker.
+# `tk_returns` is that ticker's all_returns[[tk]] entry.
 # If min_date is given, only returns whose END date >= min_date are considered
 # (used by the "Limit to most recent years" data-window filter).
-compute_term_structure <- function(tk, ranks=1L, min_date=NULL) {
+compute_term_structure <- function(tk, tk_returns, ranks=1L, min_date=NULL) {
   # `ranks` may be a scalar or integer vector (e.g. 1:5 for "top 5 ranks").
   # The output always contains a `Rank` column so chart/table code can
   # distinguish series when multiple ranks are requested.
   rows <- lapply(N_VALUES, function(n) {
-    ret_df <- all_returns[[tk]][[as.character(n)]]
+    ret_df <- tk_returns[[as.character(n)]]
     r      <- ret_df[!is.na(ret_df$ret), ]
     if (!is.null(min_date)) r <- r[r$date >= min_date, ]
     if (nrow(r) < 1L) return(NULL)
@@ -334,7 +343,7 @@ compute_term_structure <- function(tk, ranks=1L, min_date=NULL) {
         Rank          = rk,
         `N (days)`    = n,
         Worst         = asc$ret[rk],
-        `Worst Start` = fmt_date(as.Date(asc$date[rk]) - n),
+        `Worst Start` = fmt_date(asc$start[rk]),
         `Worst End`   = fmt_date(asc$date[rk]),
         Best          = desc$ret[rk],
         `Best End`    = fmt_date(desc$date[rk]),
@@ -346,22 +355,24 @@ compute_term_structure <- function(tk, ranks=1L, min_date=NULL) {
 }
 
 # Cutoff Date for the "limit to most recent X years" data-window filter,
-# relative to ticker tk's own most recent date. Returns NULL if the filter
-# is inactive / invalid (i.e., use the full history).
-years_cutoff <- function(tk, limit_active, limit_years) {
+# relative to the most recent of `dates` (one ticker's raw_data[[tk]]$date).
+# Returns NULL if the filter is inactive / invalid (i.e., use the full history).
+years_cutoff <- function(dates, limit_active, limit_years) {
   if (!isTRUE(limit_active)) return(NULL)
   if (is.null(limit_years) || is.na(limit_years) || limit_years < 1) return(NULL)
-  max(raw_data[[tk]]$date) - round(limit_years * 365.25)
+  max(dates) - round(limit_years * 365.25)
 }
 
 # Term structure for MULTIPLE tickers, combined into one long data.frame.
+# `data` and `returns` are the raw_data / all_returns in effect for the caller.
 # Each ticker's "last `limit_years` years" cutoff is relative to ITS OWN most
 # recent date (so e.g. DJI, which ends in 2023, and SPX, which ends in 2026,
 # each get their own most-recent N-year slice).
-compute_term_structure_multi <- function(tickers, ranks=1L, limit_active=FALSE, limit_years=NULL) {
+compute_term_structure_multi <- function(tickers, data, returns, ranks=1L,
+                                         limit_active=FALSE, limit_years=NULL) {
   dfs <- lapply(tickers, function(tk) {
-    cd <- years_cutoff(tk, limit_active, limit_years)
-    compute_term_structure(tk, ranks=ranks, min_date=cd)
+    cd <- years_cutoff(data[[tk]]$date, limit_active, limit_years)
+    compute_term_structure(tk, returns[[tk]], ranks=ranks, min_date=cd)
   })
   do.call(rbind, Filter(Negate(is.null), dfs))
 }
@@ -370,9 +381,9 @@ compute_term_structure_multi <- function(tickers, ranks=1L, limit_active=FALSE, 
 #
 #   df            : data.frame of already-formatted display strings. Cells
 #                    may contain raw HTML (e.g. "<span style=...>Worst</span>")
-#                    — it is rendered as-is, so callers are responsible for
-#                    escaping any untrusted text (not a concern here, since
-#                    every value comes from our own numbers/labels).
+#                    — it is rendered as-is, so callers must escape any text
+#                    a user supplied (imported index names come from a
+#                    text box or CSV headers) with htmltools::htmlEscape().
 #   numeric_cols  : column names to right-align in monospace/bold.
 #   right_cols    : column names to right-align only (no mono/bold) — e.g.
 #                    a "10.0 / 10 yr" coverage column.
@@ -726,11 +737,11 @@ APP_THEME <- bs_theme(
 # A function rather than a one-off value so it can be recomputed after a
 # new index is imported (see Section 3c) and pushed to both selectors via
 # updateSelectInput()/updateSelectizeInput().
-current_index_choices <- function() {
+current_index_choices <- function(cfg) {
   setNames(
-    names(INDEX_CFG),
-    sapply(names(INDEX_CFG), function(k)
-      paste0(INDEX_CFG[[k]]$label, "  (", k, ")")
+    names(cfg),
+    sapply(names(cfg), function(k)
+      paste0(cfg[[k]]$label, "  (", k, ")")
     )
   )
 }
@@ -906,7 +917,7 @@ page_sidebar(
     div(id = "ctrl_ticker",
       tags$p(class="text-uppercase fw-semibold text-muted mb-1",
              style="font-size:.7rem; letter-spacing:.06em", "Select Index"),
-      selectizeInput("ticker", NULL, choices=current_index_choices(),
+      selectizeInput("ticker", NULL, choices=current_index_choices(INDEX_CFG),
                     selected="SPX", width="100%",
                     options=list(dropdownParent="body")),
       uiOutput("index_pill")
@@ -984,14 +995,15 @@ page_sidebar(
              style="font-size:.7rem; letter-spacing:.06em; cursor:pointer",
              "Import / Manage Indices"),
       div(style="margin-top:8px",
-        # On hosted platforms (Connect Cloud / shinyapps.io) the app bundle is
-        # read-only; imports go to a session temp dir and are lost on restart.
-        if (IS_READONLY_HOST)
+        # On hosted platforms (Connect Cloud / shinyapps.io) imports live only
+        # in this browser session's memory (see IS_HOSTED in Section 1).
+        if (IS_HOSTED)
           div(class="alert alert-warning p-2 mb-2",
               style="font-size:.72rem; line-height:1.35",
-              tags$b("⚠️ Hosted mode:"),
-              " imports are session-only — they are not saved to disk and will",
-              " be lost when the page is refreshed or the session times out.",
+              tags$b("\u26A0\uFE0F Hosted mode:"),
+              " imports are private to this browser session \u2014 other visitors",
+              " never see them. They are not saved, and are lost when the page is",
+              " refreshed or the session times out.",
               " The 7 built-in indices are always available.")
         else NULL,
         fileInput("import_file", NULL, accept=".csv",
@@ -1119,7 +1131,7 @@ page_sidebar(
             tags$div(class="text-muted", style="font-size:.74rem",
               "Rank is set in the sidebar \u2192")
           ),
-          selectizeInput("ts_tickers", NULL, choices=current_index_choices(),
+          selectizeInput("ts_tickers", NULL, choices=current_index_choices(INDEX_CFG),
                         selected="SPX", multiple=TRUE,
                         options=list(plugins=list("remove_button"),
                                      dropdownParent="body"),
@@ -1370,8 +1382,8 @@ page_sidebar(
                         "lighter annotations. When several worst episodes fall close together (e.g. multiple days ",
                         "of the same crash), their badges stack vertically so all five labels remain readable."),
                 tags$li("The ", tags$b("End Date"), " is the day at which the return is computed; the ",
-                        tags$b("Start Date"), " is End Date minus N calendar days (approximately the start of ",
-                        "the trading window \u2014 the same convention used in the Rolling Windows and Term Structure tables)."),
+                        tags$b("Start Date"), " is the trading day N observations earlier, whose price the return ",
+                        "is measured from (the same convention used in the Rolling Windows and Term Structure tables)."),
                 tags$li("Best episodes work identically, with green shading and positive return values.")
               ),
               p(class="text-muted", style="font-size:.85rem",
@@ -1650,6 +1662,20 @@ ALL_CTRLS <- names(CTRL_DIV)
 
 server <- function(input, output, session) {
 
+  # ── Per-session index state (hosted mode) ──────────────────────────────────
+  # In hosted mode each browser session works on its own copies of the three
+  # index structures. Every read below then sees this session's copy, and the
+  # `<<-` assignments in the Import/Replace/Delete logic update it instead of
+  # the process-wide globals, so one visitor's imports never reach another.
+  # R copies on modify, so this costs nothing until a session imports data.
+  # In local mode there are no local copies: `<<-` updates the globals, and
+  # imports are shared across tabs and persisted to DATA_DIR as before.
+  if (IS_HOSTED) {
+    INDEX_CFG   <- INDEX_CFG
+    raw_data    <- raw_data
+    all_returns <- all_returns
+  }
+
   # ── UI-toggle helpers (replace shinyjs::addClass/removeClass/enable/disable) ─
   # gray_out(div_id, on): toggle the ".ctrl-disabled" class on a sidebar
   #   control-group <div> (dims it and disables pointer events via CSS).
@@ -1662,6 +1688,11 @@ server <- function(input, output, session) {
   set_disabled <- function(input_id, on) {
     session$sendCustomMessage("uiToggle", list(id=input_id, attr="disabled", state=on))
   }
+
+  # TRUE when a numericInput holds a usable positive number. A cleared field
+  # arrives as NA; outputs that need the value req() this so they simply wait
+  # for a valid entry instead of showing a raw R error.
+  is_pos_num <- function(x) is.numeric(x) && length(x) == 1 && !is.na(x) && x > 0
 
   # ── Core reactives ─────────────────────────────────────────────────────────
   # Bumped by the Import/Replace/Delete Index logic below whenever INDEX_CFG,
@@ -1680,7 +1711,10 @@ server <- function(input, output, session) {
   cfg     <- reactive({ data_version(); INDEX_CFG[[tk()]] })
 
   # "Data Window" cutoff for the currently selected index (NULL = full history)
-  cutoff_date <- reactive(years_cutoff(tk(), input$limit_active, input$limit_years))
+  cutoff_date <- reactive({
+    data_version()
+    years_cutoff(raw_data[[tk()]]$date, input$limit_active, input$limit_years)
+  })
 
   # raw(): price history, optionally truncated to the most recent N years
   raw <- reactive({
@@ -1831,7 +1865,7 @@ server <- function(input, output, session) {
     if (identical(input$import_mode, "replace")) {
       tagList(
         selectizeInput("import_replace_target", "Replace data for",
-                    choices=c("Choose an index..."="", current_index_choices()),
+                    choices=c("Choose an index..."="", current_index_choices(INDEX_CFG)),
                     width="100%", options=list(dropdownParent="body")),
         div(class="text-muted", style="font-size:.72rem",
             "Overwrites that index's data. Its name and colour stay the same."),
@@ -1861,6 +1895,14 @@ server <- function(input, output, session) {
         sprintf("Will appear as: %s  (%s)", nm, id))
   })
 
+  # Writes an index's data file into DATA_DIR. Local mode only: in hosted
+  # mode imports stay in this session's memory and nothing touches the disk.
+  save_index_file <- function(ticker, df) {
+    if (IS_HOSTED) return(invisible(NULL))
+    out <- data.frame(date=format(df$date, "%Y-%m-%d"), value=df$value)
+    write.csv(out, file.path(DATA_DIR, paste0(ticker, "_daily.csv")), row.names=FALSE)
+  }
+
   observeEvent(input$import_confirm, {
     f <- input$import_file
     if (is.null(f)) return(invisible(NULL))
@@ -1878,16 +1920,15 @@ server <- function(input, output, session) {
             nm     <- info$name
             df     <- info$df
             ticker <- slugify_ticker(nm, names(INDEX_CFG))
-            color  <- next_color()
+            color  <- next_color(INDEX_CFG)
             filename <- paste0(ticker, "_daily.csv")
 
-            out <- data.frame(date=format(df$date, "%Y-%m-%d"), value=df$value)
-            write.csv(out, file.path(IMPORT_DIR, filename), row.names=FALSE)
+            save_index_file(ticker, df)
 
             reg_row <- data.frame(ticker=ticker, label=nm, color=color,
                                    obs_years=min(10, max(1, floor(series_years(df) / 2))),
                                    default_n=20L, filename=filename, stringsAsFactors=FALSE)
-            write_registry(rbind(read_registry(), reg_row))
+            if (!IS_HOSTED) write_registry(rbind(read_registry(), reg_row))
 
             INDEX_CFG[[ticker]]   <<- list(label=nm, color=color,
                                             obs_years=reg_row$obs_years, default_n=20L)
@@ -1902,7 +1943,7 @@ server <- function(input, output, session) {
       }
 
       data_version(data_version() + 1)
-      choices <- current_index_choices()
+      choices <- current_index_choices(INDEX_CFG)
       updateSelectizeInput(session, "ticker",    choices=choices, selected=input$ticker)
       updateSelectizeInput(session, "ts_tickers",choices=choices, selected=input$ts_tickers)
 
@@ -1927,19 +1968,19 @@ server <- function(input, output, session) {
       if (is.null(ticker) || ticker == "") return(invisible(NULL))
 
       tryCatch({
-        filename <- paste0(ticker, "_daily.csv")
-        out <- data.frame(date=format(df$date, "%Y-%m-%d"), value=df$value)
-        write.csv(out, file.path(IMPORT_DIR, filename), row.names=FALSE)
+        save_index_file(ticker, df)
 
         new_obs_years <- min(10, max(1, floor(series_years(df) / 2)))
         INDEX_CFG[[ticker]]$obs_years <<- new_obs_years
         raw_data[[ticker]]    <<- df
         all_returns[[ticker]] <<- compute_returns_for_index(df)
 
-        registry <- read_registry()
-        if (ticker %in% registry$ticker) {
-          registry$obs_years[registry$ticker == ticker] <- new_obs_years
-          write_registry(registry)
+        if (!IS_HOSTED) {
+          registry <- read_registry()
+          if (ticker %in% registry$ticker) {
+            registry$obs_years[registry$ticker == ticker] <- new_obs_years
+            write_registry(registry)
+          }
         }
 
         data_version(data_version() + 1)
@@ -1958,16 +1999,15 @@ server <- function(input, output, session) {
 
       tryCatch({
         ticker <- slugify_ticker(nm, names(INDEX_CFG))
-        color  <- next_color()
+        color  <- next_color(INDEX_CFG)
         filename <- paste0(ticker, "_daily.csv")
 
-        out <- data.frame(date=format(df$date, "%Y-%m-%d"), value=df$value)
-        write.csv(out, file.path(IMPORT_DIR, filename), row.names=FALSE)
+        save_index_file(ticker, df)
 
         reg_row <- data.frame(ticker=ticker, label=nm, color=color,
                                obs_years=min(10, max(1, floor(series_years(df) / 2))),
                                default_n=20L, filename=filename, stringsAsFactors=FALSE)
-        write_registry(rbind(read_registry(), reg_row))
+        if (!IS_HOSTED) write_registry(rbind(read_registry(), reg_row))
 
         INDEX_CFG[[ticker]]   <<- list(label=nm, color=color,
                                         obs_years=reg_row$obs_years, default_n=20L)
@@ -1975,7 +2015,7 @@ server <- function(input, output, session) {
         all_returns[[ticker]] <<- compute_returns_for_index(df)
         data_version(data_version() + 1)
 
-        choices <- current_index_choices()
+        choices <- current_index_choices(INDEX_CFG)
         updateSelectizeInput(session, "ticker",    choices=choices, selected=input$ticker)
         updateSelectizeInput(session, "ts_tickers",choices=choices, selected=input$ts_tickers)
 
@@ -2023,8 +2063,9 @@ server <- function(input, output, session) {
     }
     showModal(modalDialog(
       title = "Delete index?",
-      sprintf("This removes \u201c%s (%s)\u201d and its data file. This can't be undone.",
-              INDEX_CFG[[tk_del]]$label, tk_del),
+      sprintf("This removes \u201c%s (%s)\u201d%s. This can't be undone.",
+              INDEX_CFG[[tk_del]]$label, tk_del,
+              if (IS_HOSTED) " from this session" else " and its data file"),
       footer = tagList(
         modalButton("Cancel"),
         actionButton("confirm_delete", "Delete", class="btn-danger")
@@ -2040,19 +2081,20 @@ server <- function(input, output, session) {
     }
 
     tryCatch({
-      filename <- paste0(tk_del, "_daily.csv")
-      path <- file.path(IMPORT_DIR, filename)
-      if (file.exists(path)) file.remove(path)
+      if (!IS_HOSTED) {
+        path <- file.path(DATA_DIR, paste0(tk_del, "_daily.csv"))
+        if (file.exists(path)) file.remove(path)
 
-      registry <- read_registry()
-      write_registry(registry[registry$ticker != tk_del, , drop=FALSE])
+        registry <- read_registry()
+        write_registry(registry[registry$ticker != tk_del, , drop=FALSE])
+      }
 
       INDEX_CFG[[tk_del]]   <<- NULL
       raw_data[[tk_del]]    <<- NULL
       all_returns[[tk_del]] <<- NULL
       data_version(data_version() + 1)
 
-      choices <- current_index_choices()
+      choices <- current_index_choices(INDEX_CFG)
       # If the deleted ticker was selected anywhere, fall back sensibly
       # rather than leaving the selector pointing at a now-missing choice.
       new_ticker_sel <- if (identical(input$ticker, tk_del)) unname(choices[1]) else input$ticker
@@ -2151,7 +2193,7 @@ server <- function(input, output, session) {
   output$price_chart <- renderPlot({
     df  <- raw()
     clr <- cfg()$color
-    ep  <- compute_episodes(ret_df(), n_days(), k=1)
+    ep  <- compute_episodes(ret_df(), k=1)
 
     dates  <- as.Date(df$date)
     values <- df$value
@@ -2302,7 +2344,7 @@ server <- function(input, output, session) {
 
   # ── Episodes table ─────────────────────────────────────────────────────────
   output$episodes_table <- renderUI({
-    ep <- compute_episodes(ret_df(), n_days())
+    ep <- compute_episodes(ret_df())
     if (is.null(ep)) return(NULL)
     ep_show <- ep[, c("Rank","Type","Return","Start","End")]
     ep_show$Return <- fmt_pct(ep$Return)
@@ -2323,7 +2365,8 @@ server <- function(input, output, session) {
   # ── Rolling Windows chart ──────────────────────────────────────────────────
   # Unfiltered: every anchor with >=2 obs, tagged with Coverage (yrs) & Complete
   rw_data_full <- reactive({
-    compute_rolling_windows(ret_df(), input$obs_years, n_days=n_days(), n_anchors=40)
+    req(is_pos_num(input$obs_years))
+    compute_rolling_windows(ret_df(), input$obs_years, n_anchors=40)
   })
 
   # Filtered per the "Anchor Windows" switcher
@@ -2486,9 +2529,10 @@ server <- function(input, output, session) {
     data_version()
     tickers <- input$ts_tickers
     if (is.null(tickers) || length(tickers) == 0) return(NULL)
+    req(is_pos_num(input$rank_k))
     rk <- max(1L, as.integer(input$rank_k))
     ranks <- if (identical(input$rank_mode, "range")) seq_len(rk) else rk
-    compute_term_structure_multi(tickers, ranks=ranks,
+    compute_term_structure_multi(tickers, raw_data, all_returns, ranks=ranks,
                                   limit_active=input$limit_active,
                                   limit_years=input$limit_years)
   })
@@ -2506,7 +2550,7 @@ server <- function(input, output, session) {
     rows <- lapply(tickers, function(t) {
       full <- raw_data[[t]]
       if (is.null(full)) return(NULL)
-      cd        <- years_cutoff(t, input$limit_active, input$limit_years)
+      cd        <- years_cutoff(full$date, input$limit_active, input$limit_years)
       eff_start <- if (!is.null(cd)) max(min(full$date), cd) else min(full$date)
       eff_end   <- max(full$date)
       eff_yrs   <- series_years(data.frame(date=c(eff_start, eff_end)))
@@ -2625,7 +2669,8 @@ server <- function(input, output, session) {
   output$ts_table <- renderUI({
     df <- ts_data()
     if (is.null(df)) return(NULL)
-    df$Label <- sapply(df$Ticker, function(t) INDEX_CFG[[t]]$label)
+    # Labels of imported indices are user-supplied; html_table renders raw HTML
+    df$Label <- htmltools::htmlEscape(sapply(df$Ticker, function(t) INDEX_CFG[[t]]$label))
     multi <- identical(input$rank_mode, "range") && length(unique(df$Rank)) > 1
 
     if (multi) {
@@ -2638,8 +2683,12 @@ server <- function(input, output, session) {
       df <- df[order(df$Ticker, df[["N (days)"]]), ]
     }
 
-    ord <- order(df[[ts_sort$col]], decreasing=identical(ts_sort$dir, "desc"))
-    df  <- df[ord, ]
+    # The sort column can disappear (e.g. "Rank" after switching back to
+    # Single rank mode); keep the default order then instead of emptying the table
+    if (ts_sort$col %in% names(df)) {
+      ord <- order(df[[ts_sort$col]], decreasing=identical(ts_sort$dir, "desc"))
+      df  <- df[ord, ]
+    }
 
     df$Worst <- fmt_pct(df$Worst)
     df$Best  <- fmt_pct(df$Best)
@@ -2656,6 +2705,7 @@ server <- function(input, output, session) {
   }, bg="transparent")
 
   output$def_example_table <- renderUI({
+    req(is_pos_num(input$def_n))
     n_def  <- max(1L, as.integer(input$def_n))
     prices <- c(100, 102, 98, 95, 90, 93, 97, 101, 99, 104, 108)
     rets   <- prices / lag_vec(prices, n_def) - 1
