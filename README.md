@@ -127,8 +127,9 @@ names are HTML-escaped. From the app folder:
 shiny::runTests()
 ```
 
-The **Tests** workflow (`.github/workflows/test.yml`) runs the same tests, plus a
-check that the app starts, on every pull request and on pushes to `main`.
+The **Tests** workflow (`.github/workflows/test.yml`) restores the packages in
+`renv.lock` and runs the same tests, plus a check that the app starts, on every
+pull request and on pushes to `main`.
 
 ---
 

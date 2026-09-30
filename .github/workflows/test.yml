@@ -1,7 +1,8 @@
 # .github/workflows/test.yml
 #
-# Runs the app's server tests (tests/server.R via shiny::runTests()) and
-# checks that the app starts and serves its page. Needs no secrets.
+# Restores the packages pinned in renv.lock (as the deploy does), then runs the
+# app's server tests (tests/server.R via shiny::runTests()) and checks that the
+# app starts and serves its page. Needs no secrets.
 
 name: Tests
 
@@ -25,11 +26,10 @@ jobs:
       - name: Setup R
         uses: r-lib/actions/setup-r@v2
         with:
-          use-public-rspm: true   # prebuilt Linux binaries: fast installs
+          r-version: "4.6.1"   # same as deploy.yml and renv.lock
 
-      - name: Install packages
-        run: install.packages(c("shiny", "bslib"))
-        shell: Rscript {0}
+      - name: Restore packages from renv.lock
+        uses: r-lib/actions/setup-renv@v2
 
       - name: Run server tests
         run: shiny::runTests(assert = TRUE)
