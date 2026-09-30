@@ -1,0 +1,48 @@
+# .github/workflows/test.yml
+#
+# Runs the app's server tests (tests/server.R via shiny::runTests()) and
+# checks that the app starts and serves its page. Needs no secrets.
+
+name: Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true   # prebuilt Linux binaries: fast installs
+
+      - name: Install packages
+        run: install.packages(c("shiny", "bslib"))
+        shell: Rscript {0}
+
+      - name: Run server tests
+        run: shiny::runTests(assert = TRUE)
+        shell: Rscript {0}
+
+      - name: Start the app and fetch its page
+        run: |
+          Rscript -e 'shiny::runApp(port = 8765, launch.browser = FALSE)' > app.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -fs -o page.html http://127.0.0.1:8765/ && break
+            sleep 1
+          done
+          if ! grep -q "Financial Crises Analyzer" page.html; then
+            cat app.log
+            exit 1
+          fi

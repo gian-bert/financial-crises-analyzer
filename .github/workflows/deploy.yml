@@ -27,6 +27,8 @@ on:
 
 jobs:
   deploy:
+    # Skip (rather than fail) until the one-time setup in README.md is done
+    if: ${{ vars.CONNECT_CONTENT_ID != '' }}
     runs-on: ubuntu-latest
 
     steps:
